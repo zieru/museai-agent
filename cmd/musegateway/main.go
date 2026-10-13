@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -17,12 +18,21 @@ import (
 	"musegateway/internal/account"
 	"musegateway/internal/config"
 	"musegateway/internal/gateway"
+	"musegateway/internal/updater"
+	"musegateway/internal/version"
 )
 
 func main() {
 	configPath := flag.String("config", "configs/config.yaml", "Path to configuration file")
 	loginAccountID := flag.String("login", "", "Account ID to perform interactive headed login")
+	doUpdate := flag.Bool("update", false, "Periksa dan pasang update binary terbaru dari GitHub Releases")
+	doCheck := flag.Bool("check", false, "Periksa ketersediaan update terbaru dari GitHub Releases")
 	flag.Parse()
+
+	if *doUpdate || *doCheck {
+		handleCLIUpdate(*doUpdate)
+		return
+	}
 
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
@@ -38,6 +48,7 @@ func main() {
 	// 2. Gateway Server Daemon Mode
 	fmt.Println("========================================================")
 	fmt.Println("🚀 Starting Muse AI Gateway (Go Edition)")
+	fmt.Printf("   Version:         v%s\n", version.Version)
 	fmt.Printf("   Port:            %d\n", cfg.Port)
 	fmt.Printf("   Default Model:   %s\n", cfg.DefaultModel)
 	fmt.Printf("   Headless:        %t\n", cfg.Headless)
@@ -83,6 +94,57 @@ func main() {
 	fmt.Println("Gateway stopped.")
 }
 
+func handleCLIUpdate(apply bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	fmt.Printf("🔍 Memeriksa update dari %s ...\n", version.DefaultRepo)
+	rel, asset, hasUpdate, err := updater.CheckForUpdate(ctx, version.DefaultRepo, version.Version)
+	if err != nil {
+		fmt.Printf("❌ Gagal memeriksa update: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("• Versi saat ini : v%s\n", version.Version)
+	fmt.Printf("• Release terbaru: %s (tanggal %s)\n", rel.TagName, rel.PublishedAt.Format("02 Jan 2006 15:04"))
+	if rel.Body != "" {
+		fmt.Printf("• Changelog:\n%s\n", rel.Body)
+	}
+
+	if asset == nil {
+		fmt.Printf("⚠️ Tidak ada binary yang cocok untuk sistem operasi %s/%s pada release %s.\n", runtime.GOOS, runtime.GOARCH, rel.TagName)
+		os.Exit(1)
+	}
+	fmt.Printf("• Binary asset   : %s (%.2f MB)\n", asset.Name, float64(asset.Size)/(1024*1024))
+
+	if !apply {
+		if hasUpdate {
+			fmt.Printf("✨ Update tersedia. Jalankan './musegateway-linux-musl-amd64 --update' untuk memasang.\n")
+		} else {
+			fmt.Printf("✅ Muse AI Gateway sudah menggunakan versi terbaru.\n")
+		}
+		return
+	}
+
+	if !hasUpdate {
+		fmt.Printf("✅ Versi terbaru sudah terpasang. Tidak perlu update.\n")
+		return
+	}
+
+	fmt.Printf("⬇️ Mengunduh %s ...\n", asset.Name)
+	if err := updater.ApplyUpdate(ctx, asset.BrowserDownloadURL, func(downloaded, total int64) {
+		if total > 0 {
+			pct := float64(downloaded) / float64(total) * 100
+			fmt.Printf("\r⏳ %.1f%% (%d/%d MB)", pct, downloaded/(1024*1024), total/(1024*1024))
+		}
+	}); err != nil {
+		fmt.Printf("\n❌ Gagal memasang update: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\n✅ Update berhasil dipasang ke versi %s!\n", rel.TagName)
+}
+
 func runLoginFlow(cfg *config.GatewayConfig, accountID string) {
 	var targetAccount *config.AccountConfig
 	for i := range cfg.Accounts {
@@ -93,7 +155,6 @@ func runLoginFlow(cfg *config.GatewayConfig, accountID string) {
 	}
 
 	if targetAccount == nil {
-		// Auto-register new account config
 		storageDir := filepath.Join(".", "sessions", accountID)
 		newAcc := config.AccountConfig{
 			ID:         accountID,
@@ -118,7 +179,14 @@ func runLoginFlow(cfg *config.GatewayConfig, accountID string) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserDataDir(absDir),
 		chromedp.Flag("headless", false),
-		chromedp.Flag("disable-gpu", false),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-gpu", true),
+		chromedp.Flag("disable-software-rasterizer", true),
+		chromedp.Flag("no-first-run", true),
+		chromedp.Flag("no-default-browser-check", true),
+		chromedp.Flag("window-size", "1280,800"),
 	)
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
@@ -132,9 +200,9 @@ func runLoginFlow(cfg *config.GatewayConfig, accountID string) {
 		targetURL = "https://muse.ai"
 	}
 
+	fmt.Printf("[*] Navigating browser to %s ...\n", targetURL)
 	if err := chromedp.Run(taskCtx, chromedp.Navigate(targetURL)); err != nil {
-		fmt.Printf("Failed to open browser: %v\n", err)
-		return
+		fmt.Printf("Warning during initial navigate: %v\n", err)
 	}
 
 	fmt.Print("\n--> Press ENTER after login is complete: ")

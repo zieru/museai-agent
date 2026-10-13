@@ -52,6 +52,9 @@ func NewSession(opts SessionOptions) (*Session, error) {
 
 	execOpts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.UserDataDir(absStorageDir),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-setuid-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("disable-software-rasterizer", true),
 		chromedp.Flag("disable-extensions", true),
