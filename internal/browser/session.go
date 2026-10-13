@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,27 +51,37 @@ func NewSession(opts SessionOptions) (*Session, error) {
 		return nil, fmt.Errorf("failed to create storage directory: %w", err)
 	}
 
-	execOpts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.UserDataDir(absStorageDir),
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-setuid-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-software-rasterizer", true),
-		chromedp.Flag("disable-extensions", true),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.Flag("disable-background-networking", true),
-		chromedp.Flag("disable-sync", true),
-		chromedp.Flag("disable-translate", true),
-		chromedp.Flag("mute-audio", true),
-		chromedp.Flag("window-size", "1280,800"),
-	)
-
-	if opts.Headless {
-		execOpts = append(execOpts, chromedp.Flag("headless", "new"))
+	var execOpts []chromedp.ExecAllocatorOption
+	if !opts.Headless {
+		// Clean headed options: explicitly omit any headless flags so Chrome GUI window appears
+		execOpts = []chromedp.ExecAllocatorOption{
+			chromedp.NoDefaultBrowserCheck,
+			chromedp.NoFirstRun,
+			chromedp.UserDataDir(absStorageDir),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-setuid-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("start-maximized", true),
+			chromedp.Flag("window-size", "1280,900"),
+		}
 	} else {
-		execOpts = append(execOpts, chromedp.Flag("headless", false))
+		execOpts = append(chromedp.DefaultExecAllocatorOptions[:],
+			chromedp.UserDataDir(absStorageDir),
+			chromedp.Flag("headless", "new"),
+			chromedp.Flag("no-sandbox", true),
+			chromedp.Flag("disable-setuid-sandbox", true),
+			chromedp.Flag("disable-dev-shm-usage", true),
+			chromedp.Flag("disable-gpu", true),
+			chromedp.Flag("disable-software-rasterizer", true),
+			chromedp.Flag("disable-extensions", true),
+			chromedp.Flag("no-first-run", true),
+			chromedp.Flag("no-default-browser-check", true),
+			chromedp.Flag("disable-background-networking", true),
+			chromedp.Flag("disable-sync", true),
+			chromedp.Flag("disable-translate", true),
+			chromedp.Flag("mute-audio", true),
+			chromedp.Flag("window-size", "1280,900"),
+		)
 	}
 
 	if opts.DisableImages {
@@ -83,7 +94,17 @@ func NewSession(opts SessionOptions) (*Session, error) {
 	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), execOpts...)
-	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
+
+	// Filter out harmless cosmetic cdproto unmarshal error: "unknown IPAddressSpace value: Loopback"
+	filterLog := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		if strings.Contains(msg, "unknown IPAddressSpace value: Loopback") {
+			return
+		}
+		log.Print(msg)
+	}
+
+	taskCtx, taskCancel := chromedp.NewContext(allocCtx, chromedp.WithErrorf(filterLog))
 
 	s := &Session{
 		AccountID:     opts.AccountID,
@@ -166,10 +187,7 @@ func (s *Session) UploadFiles(ctx context.Context, filePaths []string) error {
 
 // SendPrompt fills the composer, optionally attaches files, submits, and waits for reply
 func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Duration) (string, error) {
-	reqCtx, reqCancel := chromedp.NewContext(s.taskCtx)
-	defer reqCancel()
-
-	callCtx, cancel := context.WithTimeout(reqCtx, timeout)
+	callCtx, cancel := context.WithTimeout(s.taskCtx, timeout)
 	defer cancel()
 
 	if len(filePaths) > 0 {
@@ -188,6 +206,8 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 
 	var currentURL string
 	_ = chromedp.Run(callCtx, chromedp.Location(&currentURL))
+	fmt.Printf("[%s] Starting prompt execution. Current URL: %s\n", s.AccountID, currentURL)
+
 	if currentURL == "" || currentURL == "about:blank" || !strings.Contains(currentURL, "muse.ai") {
 		fmt.Printf("[%s] Navigating to %s (current: %s)...\n", s.AccountID, targetURL, currentURL)
 		if err := chromedp.Run(callCtx, chromedp.Navigate(targetURL)); err != nil {
@@ -212,8 +232,10 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 
 	var beforeAssistantText string
 	_ = chromedp.Run(callCtx, chromedp.Evaluate(extractAssistantJS, &beforeAssistantText))
+	fmt.Printf("[%s] Baseline assistant message length: %d chars\n", s.AccountID, len(beforeAssistantText))
 
 	// 3. Locate composer element
+	fmt.Printf("[%s] Searching for chat composer on page...\n", s.AccountID)
 	composerSelector := `textarea, div[contenteditable="true"], [role="textbox"]`
 	var foundComposer bool
 	findComposerJS := `(() => {
@@ -237,11 +259,13 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 	if !foundComposer {
 		var pageURL string
 		_ = chromedp.Run(callCtx, chromedp.Location(&pageURL))
+		fmt.Printf("[%s] ❌ Composer not found! Current URL: %s\n", s.AccountID, pageURL)
 		return "", fmt.Errorf("composer not found on page (current URL: %s)", pageURL)
 	}
+	fmt.Printf("[%s] Composer found! Filling prompt...\n", s.AccountID)
 
-	// 4. Fill composer and trigger React input state via both keystroke and native values
-	fillAndTypeJS := fmt.Sprintf(`(() => {
+	// 4. Fill composer and trigger React input state
+	fillAndSubmitJS := fmt.Sprintf(`(() => {
 		const candidates = ['textarea', 'div[contenteditable="true"]', '[role="textbox"]'];
 		let el = null;
 		for (const sel of candidates) {
@@ -252,53 +276,68 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 				break;
 			}
 		}
-		if (!el) return false;
+		if (!el) return { success: false, reason: "no visible element" };
 
 		el.focus();
+		const promptVal = %q;
 		if (el.tagName.toLowerCase() === 'textarea' || el.tagName.toLowerCase() === 'input') {
 			const proto = el.tagName.toLowerCase() === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
 			const nativeSet = Object.getOwnPropertyDescriptor(proto, 'value').set;
-			nativeSet.call(el, %q);
+			nativeSet.call(el, promptVal);
 			el.dispatchEvent(new Event('input', { bubbles: true }));
 			el.dispatchEvent(new Event('change', { bubbles: true }));
 		} else {
-			el.innerText = %q;
+			el.innerText = promptVal;
 			el.dispatchEvent(new Event('input', { bubbles: true }));
 		}
-		return true;
-	})()`, prompt, prompt)
 
-	_ = chromedp.Run(callCtx,
-		chromedp.Focus(composerSelector),
-		chromedp.Evaluate(fillAndTypeJS, nil),
-	)
-	time.Sleep(400 * time.Millisecond)
-
-	// 5. Submit via send button click or keyboard Enter
-	sendJS := `(() => {
-		// Look for buttons near composer that are enabled
+		// Look for send/submit button
+		const form = el.closest('form');
 		const btns = Array.from(document.querySelectorAll('button:not([disabled]), [role="button"]:not([disabled])')).filter(b => {
 			const rect = b.getBoundingClientRect();
 			return rect.width > 0 && rect.height > 0;
 		});
+		let clickedBtn = false;
 		for (const b of btns) {
 			const label = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase();
 			if (label.includes('send') || label.includes('submit') || b.type === 'submit' || b.querySelector('svg')) {
 				b.click();
-				return true;
+				clickedBtn = true;
+				break;
 			}
 		}
-		return false;
-	})()`
 
-	var clicked bool
-	_ = chromedp.Run(callCtx, chromedp.Evaluate(sendJS, &clicked))
-	if !clicked {
-		_ = chromedp.Run(callCtx, chromedp.KeyEvent("\r"))
+		// Dispatch Enter key event as well
+		const enterDown = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+		el.dispatchEvent(enterDown);
+
+		if (form && !clickedBtn) {
+			form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+		}
+
+		return { success: true, clicked: clickedBtn, tag: el.tagName, formFound: !!form };
+	})()`, prompt)
+
+	var submitResult struct {
+		Success   bool   `json:"success"`
+		Clicked   bool   `json:"clicked"`
+		Tag       string `json:"tag"`
+		FormFound bool   `json:"formFound"`
+		Reason    string `json:"reason"`
 	}
+
+	_ = chromedp.Run(callCtx,
+		chromedp.Focus(composerSelector),
+		chromedp.Evaluate(fillAndSubmitJS, &submitResult),
+	)
+	fmt.Printf("[%s] Prompt submitted: %+v\n", s.AccountID, submitResult)
+
+	// Extra physical Enter via CDP
+	_ = chromedp.Run(callCtx, chromedp.KeyEvent("\r"))
 	time.Sleep(500 * time.Millisecond)
 
 	// 6. Poll for NEW reply completion (must differ from beforeAssistantText or wait for new generation)
+	fmt.Printf("[%s] Waiting for Muse AI response...\n", s.AccountID)
 	return s.waitForReply(callCtx, beforeAssistantText)
 }
 
@@ -342,14 +381,25 @@ func (s *Session) waitForReply(ctx context.Context, beforeText string) (string, 
 		return false;
 	})()`
 
+	pollCount := 0
 	for {
 		select {
 		case <-ctx.Done():
+			var buf []byte
+			_ = chromedp.Run(ctx, chromedp.CaptureScreenshot(&buf))
+			if len(buf) > 0 {
+				_ = os.WriteFile("sessions/debug_timeout.png", buf, 0644)
+				fmt.Printf("[%s] Timeout reached! Saved debug screenshot to sessions/debug_timeout.png\n", s.AccountID)
+			}
 			if lastText != "" && lastText != beforeText {
 				return lastText, nil
 			}
 			return "", ctx.Err()
 		case <-ticker.C:
+			pollCount++
+			if pollCount%10 == 0 {
+				fmt.Printf("[%s] Still waiting for reply... (generating: %t, current text length: %d)\n", s.AccountID, hasStartedGenerating, len(lastText))
+			}
 			var isGenerating bool
 			_ = chromedp.Run(ctx, chromedp.Evaluate(isGeneratingJS, &isGenerating))
 			if isGenerating {

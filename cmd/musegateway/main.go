@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -185,23 +186,33 @@ func runLoginFlow(cfg *config.GatewayConfig, accountID string) {
 	fmt.Println("2. Open or create the chat thread.")
 	fmt.Println("3. Return to this console and press ENTER.")
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+	var opts []chromedp.ExecAllocatorOption = []chromedp.ExecAllocatorOption{
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.NoFirstRun,
 		chromedp.UserDataDir(absDir),
-		chromedp.Flag("headless", false),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-setuid-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-gpu", true),
-		chromedp.Flag("disable-software-rasterizer", true),
-		chromedp.Flag("no-first-run", true),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.Flag("window-size", "1280,800"),
-	)
+		chromedp.Flag("start-maximized", true),
+		chromedp.Flag("window-size", "1280,900"),
+	}
+
+	if targetAccount.Proxy != "" {
+		opts = append(opts, chromedp.ProxyServer(targetAccount.Proxy))
+	}
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	defer allocCancel()
 
-	taskCtx, taskCancel := chromedp.NewContext(allocCtx)
+	filterLog := func(format string, args ...interface{}) {
+		msg := fmt.Sprintf(format, args...)
+		if strings.Contains(msg, "unknown IPAddressSpace value: Loopback") {
+			return
+		}
+		log.Print(msg)
+	}
+
+	taskCtx, taskCancel := chromedp.NewContext(allocCtx, chromedp.WithErrorf(filterLog))
 	defer taskCancel()
 
 	targetURL := targetAccount.ChatURL
