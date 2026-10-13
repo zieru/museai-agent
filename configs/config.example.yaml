@@ -1,0 +1,15 @@
+# Muse AI Gateway Configuration Example
+port: 8765
+api_key: ""
+default_model: "muse/muse_01"
+headless: true
+disable_images: true
+timeout_sec: 300
+
+accounts:
+  - id: "muse_01"
+    name: "Primary Muse Account"
+    chat_url: "https://muse.ai"
+    storage_dir: "sessions/muse_01"
+    enabled: true
+    proxy: ""

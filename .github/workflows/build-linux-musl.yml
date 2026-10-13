@@ -1,0 +1,62 @@
+name: Build & Release Linux musl Binary
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-linux-musl:
+    name: Build Linux musl (x86_64 / amd64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          check-latest: true
+          cache: true
+
+      - name: Build Pure Static Linux musl Binary (Zero-CGO)
+        run: |
+          mkdir -p dist
+          # Linux AMD64 Pure Static Zero-CGO Binary (Compatible with musl/Alpine and glibc)
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -extldflags '-static'" -o dist/musegateway-linux-musl-amd64 ./cmd/musegateway
+
+      - name: Upload Linux Binary as Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: musegateway-linux-musl-amd64
+          path: dist/musegateway-linux-musl-amd64
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            dist/musegateway-linux-musl-amd64
+          generate_release_notes: true
+
+      - name: Prune Old GitHub Releases (Keep 20 Latest)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "🔍 Checking GitHub releases..."
+          gh release list --limit 1000 --json tagName --jq '.[20:][].tagName' | while read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "🗑️ Removing old release: $tag"
+              gh release delete "$tag" --yes --cleanup-tag=false
+            fi
+          done
+          echo "✅ Done pruning releases. Retained 20 most recent releases."

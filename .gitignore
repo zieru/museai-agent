@@ -1,0 +1,50 @@
+# Binaries & Executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+musegateway
+musegateway.exe
+
+# Architecture & Environment outputs
+*.out
+*.test
+
+# Go workspace & vendor
+vendor/
+go.work
+go.work.sum
+
+# Sensitive & Session data (ISOLATED SESSIONS & COOKIES)
+sessions/
+storage_state.json
+*.session
+*.cookie
+
+# Active configuration (Keep config.example.yaml tracked, ignore active configs with secrets)
+configs/config.yaml
+config.yaml
+*.env
+*.env.*
+!*.env.example
+
+# Temporary Uploads & Multimodal caches
+tmp/
+temp/
+*.tmp
+muse_upload_*
+
+# IDE & Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
