@@ -103,13 +103,13 @@ func NewSession(opts SessionOptions) (*Session, error) {
 
 // Start launches the browser and navigates to the chat page
 func (s *Session) Start(timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(s.taskCtx, timeout)
-	defer cancel()
-
-	var actions []chromedp.Action
+	// IMPORTANT CHROMEDP RULE:
+	// Do NOT set a timeout on the first Run of s.taskCtx, because timing out or cancelling
+	// that context kills the entire underlying browser process!
+	// First allocate the browser tab on s.taskCtx directly:
+	var initActions []chromedp.Action
 	if s.DisableImages {
-		// Block unnecessary heavy media assets over network
-		actions = append(actions, network.Enable(), network.SetBlockedURLS([]string{
+		initActions = append(initActions, network.Enable(), network.SetBlockedURLS([]string{
 			"*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.svg", "*.woff", "*.woff2", "*.ttf",
 		}))
 	}
@@ -119,9 +119,10 @@ func (s *Session) Start(timeout time.Duration) error {
 		targetURL = "https://muse.ai"
 	}
 
-	actions = append(actions, chromedp.Navigate(targetURL))
+	initActions = append(initActions, chromedp.Navigate(targetURL))
 
-	if err := chromedp.Run(ctx, actions...); err != nil {
+	// Run without timeout on taskCtx to keep browser alive
+	if err := chromedp.Run(s.taskCtx, initActions...); err != nil {
 		return fmt.Errorf("failed to start and navigate session %s: %w", s.AccountID, err)
 	}
 
@@ -165,7 +166,10 @@ func (s *Session) UploadFiles(ctx context.Context, filePaths []string) error {
 
 // SendPrompt fills the composer, optionally attaches files, submits, and waits for reply
 func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Duration) (string, error) {
-	callCtx, cancel := context.WithTimeout(s.taskCtx, timeout)
+	reqCtx, reqCancel := chromedp.NewContext(s.taskCtx)
+	defer reqCancel()
+
+	callCtx, cancel := context.WithTimeout(reqCtx, timeout)
 	defer cancel()
 
 	if len(filePaths) > 0 {
@@ -176,10 +180,27 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 		time.Sleep(1 * time.Second)
 	}
 
-	// 1. Locate and fill composer robustly using JS
+	// 1. Ensure page is on chat URL
+	targetURL := s.ChatURL
+	if targetURL == "" {
+		targetURL = "https://muse.ai"
+	}
+
+	var currentURL string
+	_ = chromedp.Run(callCtx, chromedp.Location(&currentURL))
+	if currentURL == "" || currentURL == "about:blank" || !strings.Contains(currentURL, "muse.ai") {
+		fmt.Printf("[%s] Navigating to %s (current: %s)...\n", s.AccountID, targetURL, currentURL)
+		if err := chromedp.Run(callCtx, chromedp.Navigate(targetURL)); err != nil {
+			return "", fmt.Errorf("failed to navigate to %s: %w", targetURL, err)
+		}
+		time.Sleep(3 * time.Second)
+	}
+
+	// 2. Locate and fill composer robustly using JS
 	fillJS := fmt.Sprintf(`(() => {
 		const candidates = [
 			'textarea[placeholder*="Message" i]',
+			'textarea[placeholder*="Ask" i]',
 			'textarea',
 			'div[contenteditable="true"]',
 			'[role="textbox"]',
@@ -188,8 +209,8 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 		let el = null;
 		for (const sel of candidates) {
 			const list = Array.from(document.querySelectorAll(sel)).filter(e => {
-				const style = window.getComputedStyle(e);
-				return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+				const rect = e.getBoundingClientRect();
+				return rect.width > 0 && rect.height > 0;
 			});
 			if (list.length > 0) {
 				list.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
@@ -211,21 +232,21 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 		return true;
 	})()`, prompt, prompt)
 
+	// Poll composer up to 15 seconds
 	var filled bool
-	composerSelector := `textarea, div[contenteditable="true"], [role="textbox"]`
-	_ = chromedp.Run(callCtx,
-		chromedp.WaitVisible(composerSelector),
-		chromedp.Evaluate(fillJS, &filled),
-	)
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = chromedp.Run(callCtx, chromedp.Evaluate(fillJS, &filled))
+		if filled {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 
 	if !filled {
-		// Fallback to chromedp native input
-		if err := chromedp.Run(callCtx,
-			chromedp.Focus(composerSelector),
-			chromedp.SetValue(composerSelector, prompt),
-		); err != nil {
-			return "", fmt.Errorf("failed to populate composer: %w", err)
-		}
+		var pageURL string
+		_ = chromedp.Run(callCtx, chromedp.Location(&pageURL))
+		return "", fmt.Errorf("composer not found on page (current URL: %s)", pageURL)
 	}
 
 	// 2. Submit via send button or Enter key
