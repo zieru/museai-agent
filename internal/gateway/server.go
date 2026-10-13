@@ -169,8 +169,84 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Return OpenAI Chat Completion response
+	msgID := fmt.Sprintf("chatcmpl-muse-%d", time.Now().Unix())
+
+	if req.Stream {
+		// Server-Sent Events (SSE) streaming format
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+
+		// Initial chunk with role
+		initChunk := map[string]interface{}{
+			"id":      msgID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   req.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]string{
+						"role": "assistant",
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		data, _ := json.Marshal(initChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+
+		// Content chunk
+		contentChunk := map[string]interface{}{
+			"id":      msgID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   req.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]string{
+						"content": reply,
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		data, _ = json.Marshal(contentChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+
+		// Final finish chunk
+		finishChunk := map[string]interface{}{
+			"id":      msgID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   req.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]string{},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		data, _ = json.Marshal(finishChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
 	resp := map[string]interface{}{
-		"id":      fmt.Sprintf("chatcmpl-muse-%d", time.Now().Unix()),
+		"id":      msgID,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   req.Model,

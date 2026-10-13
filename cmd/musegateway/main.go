@@ -18,6 +18,7 @@ import (
 	"musegateway/internal/account"
 	"musegateway/internal/config"
 	"musegateway/internal/gateway"
+	"musegateway/internal/instance"
 	"musegateway/internal/updater"
 	"musegateway/internal/version"
 )
@@ -46,6 +47,14 @@ func main() {
 	}
 
 	// 2. Gateway Server Daemon Mode
+	// Single instance check
+	cleanupLock, err := instance.EnsureSingleInstance("sessions")
+	if err != nil {
+		log.Printf("Warning single instance: %v", err)
+	} else {
+		defer cleanupLock()
+	}
+
 	fmt.Println("========================================================")
 	fmt.Println("🚀 Starting Muse AI Gateway (Go Edition)")
 	fmt.Printf("   Version:         v%s\n", version.Version)
