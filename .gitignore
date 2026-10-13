@@ -6,8 +6,8 @@
 *.dylib
 bin/
 dist/
-musegateway
-musegateway.exe
+/musegateway
+/musegateway.exe
 
 # Architecture & Environment outputs
 *.out
