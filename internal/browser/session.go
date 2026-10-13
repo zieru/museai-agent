@@ -196,25 +196,59 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 		time.Sleep(3 * time.Second)
 	}
 
-	// 2. Locate and fill composer robustly using JS
-	fillJS := fmt.Sprintf(`(() => {
-		const candidates = [
-			'textarea[placeholder*="Message" i]',
-			'textarea[placeholder*="Ask" i]',
-			'textarea',
-			'div[contenteditable="true"]',
-			'[role="textbox"]',
-			'input[type="text"]'
-		];
+	// 2. Capture baseline assistant text before sending new prompt
+	extractAssistantJS := `(() => {
+		const bubbles = Array.from(document.querySelectorAll('.hatch-chat-groupable-bubble, [data-role="assistant"], div[class*="message-bubble" i], article'));
+		for (let i = bubbles.length - 1; i >= 0; i--) {
+			const b = bubbles[i];
+			const cls = b.className || "";
+			const isUser = cls.includes("user") || cls.includes("bg-chat-user-bubble");
+			if (!isUser) {
+				return b.innerText.trim();
+			}
+		}
+		return "";
+	})()`
+
+	var beforeAssistantText string
+	_ = chromedp.Run(callCtx, chromedp.Evaluate(extractAssistantJS, &beforeAssistantText))
+
+	// 3. Locate composer element
+	composerSelector := `textarea, div[contenteditable="true"], [role="textbox"]`
+	var foundComposer bool
+	findComposerJS := `(() => {
+		const candidates = ['textarea', 'div[contenteditable="true"]', '[role="textbox"]'];
+		for (const sel of candidates) {
+			const els = Array.from(document.querySelectorAll(sel)).filter(e => e.getBoundingClientRect().width > 0);
+			if (els.length > 0) return true;
+		}
+		return false;
+	})()`
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		_ = chromedp.Run(callCtx, chromedp.Evaluate(findComposerJS, &foundComposer))
+		if foundComposer {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	if !foundComposer {
+		var pageURL string
+		_ = chromedp.Run(callCtx, chromedp.Location(&pageURL))
+		return "", fmt.Errorf("composer not found on page (current URL: %s)", pageURL)
+	}
+
+	// 4. Fill composer and trigger React input state via both keystroke and native values
+	fillAndTypeJS := fmt.Sprintf(`(() => {
+		const candidates = ['textarea', 'div[contenteditable="true"]', '[role="textbox"]'];
 		let el = null;
 		for (const sel of candidates) {
-			const list = Array.from(document.querySelectorAll(sel)).filter(e => {
-				const rect = e.getBoundingClientRect();
-				return rect.width > 0 && rect.height > 0;
-			});
-			if (list.length > 0) {
-				list.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
-				el = list[0];
+			const els = Array.from(document.querySelectorAll(sel)).filter(e => e.getBoundingClientRect().width > 0);
+			if (els.length > 0) {
+				els.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+				el = els[0];
 				break;
 			}
 		}
@@ -222,7 +256,9 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 
 		el.focus();
 		if (el.tagName.toLowerCase() === 'textarea' || el.tagName.toLowerCase() === 'input') {
-			el.value = %q;
+			const proto = el.tagName.toLowerCase() === 'textarea' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+			const nativeSet = Object.getOwnPropertyDescriptor(proto, 'value').set;
+			nativeSet.call(el, %q);
 			el.dispatchEvent(new Event('input', { bubbles: true }));
 			el.dispatchEvent(new Event('change', { bubbles: true }));
 		} else {
@@ -232,28 +268,18 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 		return true;
 	})()`, prompt, prompt)
 
-	// Poll composer up to 15 seconds
-	var filled bool
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		_ = chromedp.Run(callCtx, chromedp.Evaluate(fillJS, &filled))
-		if filled {
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+	_ = chromedp.Run(callCtx,
+		chromedp.Focus(composerSelector),
+		chromedp.Evaluate(fillAndTypeJS, nil),
+	)
+	time.Sleep(400 * time.Millisecond)
 
-	if !filled {
-		var pageURL string
-		_ = chromedp.Run(callCtx, chromedp.Location(&pageURL))
-		return "", fmt.Errorf("composer not found on page (current URL: %s)", pageURL)
-	}
-
-	// 2. Submit via send button or Enter key
+	// 5. Submit via send button click or keyboard Enter
 	sendJS := `(() => {
-		const btns = Array.from(document.querySelectorAll('button, [role="button"]')).filter(b => {
-			const style = window.getComputedStyle(b);
-			return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+		// Look for buttons near composer that are enabled
+		const btns = Array.from(document.querySelectorAll('button:not([disabled]), [role="button"]:not([disabled])')).filter(b => {
+			const rect = b.getBoundingClientRect();
+			return rect.width > 0 && rect.height > 0;
 		});
 		for (const b of btns) {
 			const label = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase();
@@ -270,20 +296,26 @@ func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Dur
 	if !clicked {
 		_ = chromedp.Run(callCtx, chromedp.KeyEvent("\r"))
 	}
+	time.Sleep(500 * time.Millisecond)
 
-	// 3. Poll for reply completion
-	return s.waitForReply(callCtx, prompt)
+	// 6. Poll for NEW reply completion (must differ from beforeAssistantText or wait for new generation)
+	return s.waitForReply(callCtx, beforeAssistantText)
 }
 
-func (s *Session) waitForReply(ctx context.Context, originalPrompt string) (string, error) {
+func (s *Session) waitForReply(ctx context.Context, beforeText string) (string, error) {
 	ticker := time.NewTicker(600 * time.Millisecond)
 	defer ticker.Stop()
 
 	var lastText string
 	settleCount := 0
+	hasStartedGenerating := false
 
 	// JS to retrieve latest assistant message text
 	extractJS := `(() => {
+		// Scroll to bottom
+		const scroller = document.getElementById('hatch-chat-scroll') || document.querySelector('[class*="overflow-y-auto"]');
+		if (scroller) scroller.scrollTop = scroller.scrollHeight;
+
 		const bubbles = Array.from(document.querySelectorAll('.hatch-chat-groupable-bubble, [data-role="assistant"], div[class*="message-bubble" i], article'));
 		if (bubbles.length === 0) {
 			const texts = Array.from(document.querySelectorAll('div[class*="message" i]')).map(b => b.innerText.trim()).filter(Boolean);
@@ -313,13 +345,16 @@ func (s *Session) waitForReply(ctx context.Context, originalPrompt string) (stri
 	for {
 		select {
 		case <-ctx.Done():
-			if lastText != "" {
+			if lastText != "" && lastText != beforeText {
 				return lastText, nil
 			}
 			return "", ctx.Err()
 		case <-ticker.C:
 			var isGenerating bool
 			_ = chromedp.Run(ctx, chromedp.Evaluate(isGeneratingJS, &isGenerating))
+			if isGenerating {
+				hasStartedGenerating = true
+			}
 
 			var curText string
 			err := chromedp.Run(ctx, chromedp.Evaluate(extractJS, &curText))
@@ -327,11 +362,20 @@ func (s *Session) waitForReply(ctx context.Context, originalPrompt string) (stri
 				continue
 			}
 
-			// Clean whitespace
 			curText = strings.TrimSpace(curText)
+
+			// CRITICAL: If new generation hasn't started and text is identical to previous bubble, keep waiting!
+			if !hasStartedGenerating && curText == beforeText && beforeText != "" {
+				continue
+			}
+
+			if curText != beforeText {
+				hasStartedGenerating = true
+			}
+
 			if curText == lastText && curText != "" {
 				settleCount++
-				// If not generating and output stable for 3 consecutive intervals (~1.8s), generation finished
+				// Generation settled
 				if !isGenerating && settleCount >= 3 {
 					return curText, nil
 				}
