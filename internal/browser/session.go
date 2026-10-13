@@ -164,8 +164,8 @@ func (s *Session) UploadFiles(ctx context.Context, filePaths []string) error {
 }
 
 // SendPrompt fills the composer, optionally attaches files, submits, and waits for reply
-func (s *Session) SendPrompt(ctx context.Context, prompt string, filePaths []string, timeout time.Duration) (string, error) {
-	callCtx, cancel := context.WithTimeout(ctx, timeout)
+func (s *Session) SendPrompt(prompt string, filePaths []string, timeout time.Duration) (string, error) {
+	callCtx, cancel := context.WithTimeout(s.taskCtx, timeout)
 	defer cancel()
 
 	if len(filePaths) > 0 {
@@ -176,24 +176,77 @@ func (s *Session) SendPrompt(ctx context.Context, prompt string, filePaths []str
 		time.Sleep(1 * time.Second)
 	}
 
-	// 1. Locate and fill composer
+	// 1. Locate and fill composer robustly using JS
+	fillJS := fmt.Sprintf(`(() => {
+		const candidates = [
+			'textarea[placeholder*="Message" i]',
+			'textarea',
+			'div[contenteditable="true"]',
+			'[role="textbox"]',
+			'input[type="text"]'
+		];
+		let el = null;
+		for (const sel of candidates) {
+			const list = Array.from(document.querySelectorAll(sel)).filter(e => {
+				const style = window.getComputedStyle(e);
+				return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+			});
+			if (list.length > 0) {
+				list.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top);
+				el = list[0];
+				break;
+			}
+		}
+		if (!el) return false;
+
+		el.focus();
+		if (el.tagName.toLowerCase() === 'textarea' || el.tagName.toLowerCase() === 'input') {
+			el.value = %q;
+			el.dispatchEvent(new Event('input', { bubbles: true }));
+			el.dispatchEvent(new Event('change', { bubbles: true }));
+		} else {
+			el.innerText = %q;
+			el.dispatchEvent(new Event('input', { bubbles: true }));
+		}
+		return true;
+	})()`, prompt, prompt)
+
+	var filled bool
 	composerSelector := `textarea, div[contenteditable="true"], [role="textbox"]`
-	err := chromedp.Run(callCtx,
+	_ = chromedp.Run(callCtx,
 		chromedp.WaitVisible(composerSelector),
-		chromedp.Focus(composerSelector),
-		chromedp.SetValue(composerSelector, prompt),
+		chromedp.Evaluate(fillJS, &filled),
 	)
-	if err != nil {
-		return "", fmt.Errorf("failed to populate composer: %w", err)
+
+	if !filled {
+		// Fallback to chromedp native input
+		if err := chromedp.Run(callCtx,
+			chromedp.Focus(composerSelector),
+			chromedp.SetValue(composerSelector, prompt),
+		); err != nil {
+			return "", fmt.Errorf("failed to populate composer: %w", err)
+		}
 	}
 
 	// 2. Submit via send button or Enter key
-	sendBtnSelector := `button[type="submit"], button[aria-label*="send" i], button[aria-label="Send"]`
-	subErr := chromedp.Run(callCtx,
-		chromedp.Click(sendBtnSelector),
-	)
-	if subErr != nil {
-		// Fallback: send Enter key
+	sendJS := `(() => {
+		const btns = Array.from(document.querySelectorAll('button, [role="button"]')).filter(b => {
+			const style = window.getComputedStyle(b);
+			return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+		});
+		for (const b of btns) {
+			const label = (b.getAttribute('aria-label') || b.innerText || '').toLowerCase();
+			if (label.includes('send') || label.includes('submit') || b.type === 'submit' || b.querySelector('svg')) {
+				b.click();
+				return true;
+			}
+		}
+		return false;
+	})()`
+
+	var clicked bool
+	_ = chromedp.Run(callCtx, chromedp.Evaluate(sendJS, &clicked))
+	if !clicked {
 		_ = chromedp.Run(callCtx, chromedp.KeyEvent("\r"))
 	}
 

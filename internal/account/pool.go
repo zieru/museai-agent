@@ -112,7 +112,7 @@ func (p *Pool) GetAccount(preferredID string) (*ManagedAccount, error) {
 }
 
 // ExecutePrompt runs a prompt with isolated mutex locking per account
-func (a *ManagedAccount) ExecutePrompt(ctx context.Context, prompt string, files []string, timeout time.Duration) (string, error) {
+func (a *ManagedAccount) ExecutePrompt(reqCtx context.Context, prompt string, files []string, timeout time.Duration) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -122,5 +122,5 @@ func (a *ManagedAccount) ExecutePrompt(ctx context.Context, prompt string, files
 		a.isBusy = false
 	}()
 
-	return a.Session.SendPrompt(ctx, prompt, files, timeout)
+	return a.Session.SendPrompt(prompt, files, timeout)
 }
